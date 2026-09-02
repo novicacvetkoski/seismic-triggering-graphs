@@ -1,6 +1,0 @@
-,timestamp_jst,timestamp_utc,region,event_type,latitude,longitude,depth_km,magnitude,magnitude_type,origin_time_uncertainty_sec,latitude_uncertainty_km,longitude_uncertainty_km,depth_uncertainty_km,num_p_stations,num_total_stations,source_file
-0,1997-10-01 00:24:42.490,1997-09-30 15:24:42.490,FAR SE OFF BOSO PEN,normal,34.077666666666666,141.576,29,2.5,V,0.36,1.11,2.03,3.15,3,107.0,d199710a.txt
-1,1997-10-01 00:36:08.950,1997-09-30 15:36:08.950,NW KAGOSHIMA PREF,normal,31.97433333333333,130.2505,7,1.2,V,0.05,0.18,0.25,1.19,7,273.0,d199710a.txt
-2,1997-10-01 00:46:05.480,1997-09-30 15:46:05.480,NW KAGOSHIMA PREF,normal,31.859,130.30816666666666,6,0.4,v,0.05,0.17,0.3,1.58,7,273.0,d199710a.txt
-3,1997-10-01 00:46:40.680,1997-09-30 15:46:40.680,TOKYO BAY REGION,poor_solution,35.43366666666667,139.628,68,0.8,V,0.48,1.08,1.62,3.87,3,96.0,d199710a.txt
-4,1997-10-01 00:55:58.880,1997-09-30 15:55:58.880,NW KAGOSHIMA PREF,normal,31.9855,130.3055,11,0.8,V,0.07,0.25,0.32,0.83,7,273.0,d199710a.txt

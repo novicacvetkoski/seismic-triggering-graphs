@@ -1,5 +1,0 @@
-time,latitude,longitude,depth,mag,magType,nst,gap,dmin,rms,net,id,updated,place,type,horizontalError,depthError,magError,magNst,status,locationSource,magSource
-2024-11-26T17:19:47.379Z,37.0257,136.4128,10,4.9,mww,99,57,1.516,0.8,us,us7000nub4,2024-11-26T17:46:04.040Z,"36 km WNW of Hakui, Japan",earthquake,6.01,1.843,0.11,8,reviewed,us,us
-2024-11-26T14:52:51.262Z,36.9528,136.3613,5.404,4.9,mww,94,51,1.535,0.68,us,us7000nu9d,2024-11-26T15:10:17.040Z,"38 km WNW of Hakui, Japan",earthquake,5.32,3.887,0.11,8,reviewed,us,us
-2024-11-26T14:13:50.353Z,36.9141,136.3469,6.766,4.5,mb,43,54,1.537,0.82,us,us7000nu95,2024-11-26T14:35:30.040Z,"39 km W of Hakui, Japan",earthquake,5.81,4.334,0.106,26,reviewed,us,us
-2024-11-26T13:47:03.695Z,37.0484,136.3492,10,6.1,mww,276,15,1.571,0.8,us,us7000nu90,2024-11-27T01:15:48.473Z,"42 km WNW of Hakui, Japan",earthquake,6.22,1.72,0.036,73,reviewed,us,us
