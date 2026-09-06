@@ -181,17 +181,38 @@ class MISD:
                      (self.lons[j] - self.lons[i])**2)
         return self.rho[i] * self._temporal_kernel(dt) * self._spatial_kernel(dr)
 
+    def _rate_matrix_vectorized(self):
+        """
+        Fully vectorised computation of the pairwise triggering-rate matrix
+        R[i,j] = ρ(m_i) · g_t(t_j - t_i) · g_s(r_ij)  for i < j, else 0.
+
+        Uses NumPy broadcasting over the full (N, N) grid instead of a
+        double Python loop — this turns the O(N^2) rate-matrix build from
+        hours into minutes/seconds on catalogues of a few thousand events.
+        """
+        dt = self.times[np.newaxis, :] - self.times[:, np.newaxis]      # dt[i,j] = t_j - t_i
+        dlat = self.lats[np.newaxis, :] - self.lats[:, np.newaxis]
+        dlon = self.lons[np.newaxis, :] - self.lons[:, np.newaxis]
+        dr = np.sqrt(dlat ** 2 + dlon ** 2)
+
+        causal_mask = dt > 0   # only i < j (in time) contribute
+
+        g_t = self._temporal_kernel(np.where(causal_mask, dt, 1.0))
+        g_s = self._spatial_kernel(dr)
+
+        R = self.rho[:, np.newaxis] * g_t * g_s
+        R[~causal_mask] = 0.0
+        np.fill_diagonal(R, 0.0)
+        return R
+
     # ── EM ─────────────────────────────────────────────────────────────────────
 
     def fit(self):
         log.info("Starting MISD EM  (N=%d, max_iter=%d)", self.N, self.max_iter)
 
-        # Pre-compute pairwise triggering rates (lower-triangle only)
-        log.info("Pre-computing triggering rate matrix …")
-        R = np.zeros((self.N, self.N))
-        for j in tqdm(range(1, self.N), desc="  Rate matrix"):
-            for i in range(j):
-                R[i, j] = self._triggering_rate(i, j)
+        # Pre-compute pairwise triggering rates (vectorised, lower-triangle only)
+        log.info("Pre-computing triggering rate matrix (vectorised) …")
+        R = self._rate_matrix_vectorized()
 
         mu_old = self.mu.copy()
 
@@ -223,14 +244,11 @@ class MISD:
             total_w = w_trig.sum()
 
             if total_w > 0:
-                # weighted variance of Δt
-                dt_mat = np.zeros((self.N, self.N))
-                dr_mat = np.zeros((self.N, self.N))
-                for j in range(1, self.N):
-                    dt_mat[:j, j] = self.times[j] - self.times[:j]
-                    dr_mat[:j, j] = np.sqrt(
-                        (self.lats[j]  - self.lats[:j])**2 +
-                        (self.lons[j]  - self.lons[:j])**2)
+                # weighted variance of Δt (vectorised, no explicit loop)
+                dt_mat = self.times[np.newaxis, :] - self.times[:, np.newaxis]
+                dlat_mat = self.lats[np.newaxis, :] - self.lats[:, np.newaxis]
+                dlon_mat = self.lons[np.newaxis, :] - self.lons[:, np.newaxis]
+                dr_mat = np.sqrt(dlat_mat ** 2 + dlon_mat ** 2)
 
                 self.sigma_t = np.sqrt((w_trig * dt_mat**2).sum() / total_w)
                 self.sigma_s = np.sqrt((w_trig * dr_mat**2).sum() / total_w)
@@ -246,10 +264,8 @@ class MISD:
                 log.info("Converged at iteration %d.", iteration + 1)
                 break
 
-            # Recompute R with updated kernels
-            for j in tqdm(range(1, self.N), desc=f"  Iter {iteration+1} rate matrix", leave=False):
-                for i in range(j):
-                    R[i, j] = self._triggering_rate(i, j)
+            # Recompute R with updated kernels (vectorised)
+            R = self._rate_matrix_vectorized()
 
             mu_old = self.mu.copy()
 
@@ -302,7 +318,9 @@ def build_knowledge_graph(df: pd.DataFrame, misd: MISD,
         intermediates = set(G.successors(i)) & set(G.predecessors(j))
         if intermediates:
             G[i][j]["edge_type"] = "indirect"
-            G[i][j]["via"]       = list(intermediates)[:5]   # store up to 5
+            # GraphML cannot serialise list-valued attributes — join to a
+            # comma-separated string (store up to 5 intermediates)
+            G[i][j]["via"]       = ",".join(str(k) for k in list(intermediates)[:5])
 
     n_direct   = sum(1 for _, _, d in G.edges(data=True) if d["edge_type"] == "direct")
     n_indirect = sum(1 for _, _, d in G.edges(data=True) if d["edge_type"] == "indirect")
@@ -377,10 +395,26 @@ def visualise_subgraph(G: nx.DiGraph, df: pd.DataFrame,
         ego_nodes |= next_frontier
         frontier = next_frontier
 
+    # Cap the ego-network size to keep dense aftershock zones legible.
+    # If we overflow, keep the seed plus the highest-magnitude nodes.
+    MAX_VIZ_NODES = 150
+    if len(ego_nodes) > MAX_VIZ_NODES:
+        ranked = sorted(ego_nodes, key=lambda n: df.loc[n, "mag"], reverse=True)
+        keep = set(ranked[:MAX_VIZ_NODES])
+        keep.add(seed_idx)
+        log.info("Ego-network has %d nodes; capping to top %d by magnitude.",
+                 len(ego_nodes), len(keep))
+        ego_nodes = keep
+
     sub = G.subgraph(ego_nodes).copy()
 
-    # Layout: longitude / latitude as (x, y)
-    pos = {n: (df.loc[n, "longitude"], df.loc[n, "latitude"]) for n in sub.nodes()}
+    # Layout: force-directed (spring) layout seeded from geographic
+    # positions. Pure lon/lat positions cause heavy overlap in dense
+    # aftershock clusters; spring_layout, initialised at the true
+    # geographic coordinates, spreads nodes apart while keeping the
+    # overall spatial structure recognisable.
+    geo_pos = {n: (df.loc[n, "longitude"], df.loc[n, "latitude"]) for n in sub.nodes()}
+    pos = nx.spring_layout(sub, pos=geo_pos, seed=42, k=0.3, iterations=50)
 
     # Node sizes ∝ magnitude
     sizes = [30 * (df.loc[n, "mag"] ** 2) for n in sub.nodes()]
@@ -391,8 +425,10 @@ def visualise_subgraph(G: nx.DiGraph, df: pd.DataFrame,
     edge_widths  = [2.5 * d["weight"] + 0.3 for _, _, d in sub.edges(data=True)]
 
     # Node colours: background probability
+    # coolwarm (not coolwarm_r): high background-probability -> red,
+    # low background-probability (triggered) -> blue, matching the legend
     bg_probs   = [G.nodes[n].get("is_background", 0.5) for n in sub.nodes()]
-    node_cmap  = cm.get_cmap("coolwarm_r")
+    node_cmap  = cm.get_cmap("coolwarm")
     node_colors = [node_cmap(p) for p in bg_probs]
 
     fig, ax = plt.subplots(figsize=(12, 10))
