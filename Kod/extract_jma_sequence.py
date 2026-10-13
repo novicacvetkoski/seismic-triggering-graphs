@@ -3,13 +3,13 @@ extract_jma_sequence.py
 ------------------------
 Extracts a spatiotemporal subset (one earthquake sequence) from the large
 merged JMA hypocenter catalogue CSV and writes it out in the column schema
-that seismic_kg_misd.py / seismic_kg_etas.py already expect:
+that seismic_kg_misd_gaussov.py / seismic_kg_etas.py already expect:
 
     time, latitude, longitude, depth, mag, magType, id, source_file
     (plus region / event_type kept for reference / QA)
 
 This means you generally do NOT need to touch the loader in
-seismic_kg_misd.py -- just point CATALOGUE_PATH at the file this script
+seismic_kg_misd_gaussov.py -- just point CATALOGUE_PATH at the file this script
 produces for each sequence.
 
 Why chunked reading
@@ -43,7 +43,7 @@ Notes
   down magnitude_type counts for the extracted window so you can confirm
   each sequence is on a single homogeneous scale before running
   MISD/ETAS (the triggering kernel assumes one scale throughout).
-* MAX_EVENTS in seismic_kg_misd.py / seismic_kg_etas.py may need
+* MAX_EVENTS in seismic_kg_misd_gaussov.py / seismic_kg_etas.py may need
   attention after extraction -- see the printed event count. The MISD
   script's rate-matrix computation is O(N^2) in a Python loop; a raw
   swarm extract (e.g. Noto, tens of thousands of events at low Mc) will
@@ -160,7 +160,7 @@ def main():
     result.sort_values("_ts_utc", inplace=True)
     result.reset_index(drop=True, inplace=True)
 
-    # ── remap to the schema seismic_kg_misd.py / seismic_kg_etas.py expect ──
+    # ── remap to the schema seismic_kg_misd_gaussov.py / seismic_kg_etas.py expect ──
     out = pd.DataFrame()
     out["time"]        = result["_ts_utc"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     out["latitude"]    = result["latitude"]

@@ -1,774 +1,365 @@
 """
-seismic_kg_etas.py
-===================
-Builds a seismic "family tree" Knowledge Graph (KG) from the merged Japan
-earthquake catalogue using the space-time ETAS model (Epidemic-Type
-Aftershock Sequence; Ogata, 1988, 1998) fitted by the stochastic
-declustering EM algorithm of Zhuang, Ogata & Vere-Jones (2002, 2004).
+seismic_kg_etas.py   (v2)
+=========================
+Space-time ETAS (Ogata 1988, 1998) fitted by the stochastic-declustering EM algorithm
+(Zhuang, Ogata & Vere-Jones 2002), producing the same seismic "family tree" graph as
+seismic_kg_misd.py (shared code in kg_common.py).
 
-This is the parametric counterpart to seismic_kg_misd.py. Where MISD
-estimates the triggering density g(Δt, Δr) *nonparametrically* (as a
-histogram / kernel, re-estimated at every EM iteration with no fixed
-functional form), ETAS assumes a specific parametric shape for the
-triggering kernel from the outset:
+    lambda(t,x,y) = mu(x,y) + sum_{i: t_i<t} K 10^(alpha (m_i - mc)) (t - t_i + c)^(-p)
+                              * (q-1)/(pi d_i) (1 + r^2/d_i)^(-q),     d_i = d 10^(gamma (m_i - mc))
 
-    Temporal :  Omori-Utsu law           ~ (t - t_i + c)^(-p)
-    Magnitude:  Gutenberg-Richter scaling ~ 10^(alpha * (m_i - m_cut))
-    Spatial  :  long-tailed isotropic     ~ (1 + r^2 / d(m_i))^(-q)
+What changed relative to v1
+  * Distances in km (same projection as MISD); d is in km^2. Rates are events/day/km^2.
+  * BACKGROUND: by default IMPOSED (--background fixed): mu = --bg-rate, the long-term rate measured
+    in the years before the sequence (estimate_background_rate.py) -- identical to the rate given to
+    MISD, so the two models differ only in the triggering kernel. --background kde estimates a smooth
+    spatial background by adaptive KDE, now in correct units (events/day/km^2).
+  * M-step: exact ANALYTIC gradient and log-parametrisation of (K, c, d), so L-BFGS-B converges in
+    far fewer iterations (v1 used finite differences: ~8 objective evaluations per gradient).
+  * Convergence is monitored with the TRUE log-likelihood sum_j log lambda_j - int(mu) - compensator,
+    and every iteration's parameters are saved (trace CSV + plot).
+  * After the last iteration a final E-step is run, so the saved probabilities always correspond to
+    the saved parameters (in v1 they lagged by one M-step when the iteration cap was reached).
+  * Edges are "P(parent)" edges with an `is_best_parent` flag (no "indirect" label); node importance =
+    weighted out-strength; probability checks, pairs file and run JSON are written (see kg_common.py).
 
-and estimates the small parameter vector (mu, K, c, p, alpha, d, gamma, q)
-by maximum likelihood instead of estimating a full N x N nonparametric
-kernel. The two models are complementary: MISD makes no assumption about
-the triggering kernel's shape (useful for checking whether Omori/GR/ETAS
-assumptions are reasonable for the catalogue), while ETAS gives a compact,
-interpretable, well-studied parametrisation that is directly comparable to
-the seismology literature (and to JMA-catalogue ETAS studies).
+Known limitations (state them in the thesis)
+  * The compensator integrates the spatial kernel over the whole plane (boundary edge effects of the
+    study box are neglected); epicentral distances only (no fault geometry for large events).
+  * For d the data can only resolve scales above the location error (~1 km); very small fitted d
+    values are weakly identified.
 
-Everything downstream of the triggering-probability matrix w[i,j] --
-knowledge-graph construction, direct/indirect edge labelling, GraphML /
-CSV export, and ego-network visualisation -- is intentionally kept
-IDENTICAL to seismic_kg_misd.py so that the two graphs are directly
-comparable node-for-node and edge-for-edge.
-
-Pipeline
---------
-  1. Load & filter the merged catalogue               (identical to MISD)
-  2. Fit ETAS via stochastic-declustering EM:
-       E-step : w[i,j] = P(j triggered by i),  w_bg[j] = P(j background)
-       M-step : (a) re-estimate spatially-variable background mu(x,y) via
-                    adaptive kernel smoothing of background-weighted events
-                (b) re-estimate ETAS params (K,c,p,alpha,d,gamma,q) by
-                    weighted MLE (numerical optimisation) on the current
-                    E-step weights
-  3. Build a directed NetworkX graph from the converged w[i,j] matrix
-  4. Identify direct vs. indirect (cascade) edges
-  5. Export the graph (GraphML + edge-list CSV) for downstream use
-  6. Print a summary and plot a small subgraph + parameter estimates
-
-Dependencies
-------------
-  pip install pandas numpy scipy networkx matplotlib tqdm
-
-References
-----------
-  Ogata, Y. (1988). Statistical models for earthquake occurrences and
-    residual analysis for point processes. JASA, 83(401), 9-27.
-  Ogata, Y. (1998). Space-time point-process models for earthquake
-    occurrences. Ann. Inst. Statist. Math., 50(2), 379-402.
-  Zhuang, J., Ogata, Y., & Vere-Jones, D. (2002). Stochastic declustering
-    of space-time earthquake occurrences. JASA, 97(458), 369-380.
-  Zhuang, J. (2011). Next-day earthquake forecasts by using the ETAS model.
-    Earth, Planets and Space, 63, 207-216. (tutorial on the EM recipe used
-    here for the M-step split into temporal / spatial / background parts)
+Dependencies:  pip install pandas numpy scipy networkx matplotlib
 """
-
 import argparse
 import logging
+import os
+import time
+
 import numpy as np
 import pandas as pd
-import networkx as nx
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-from tqdm import tqdm
 from scipy.optimize import minimize
 from scipy.spatial.distance import cdist
 
+import kg_common as C
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
-log = logging.getLogger(__name__)
+log = logging.getLogger("etas")
+
+LN10 = np.log(10.0)
+
+# ── configuration ───────────────────────────────────────────────────────────────
+ETAS_MAX_ITER = 30
+ETAS_TOL = 1e-5                  # relative change of the log-likelihood (parameters then stable to ~0.3%)
+ETAS_OPTIMIZER_MAXITER = 50      # L-BFGS-B iterations per M-step (cheap now: analytic gradient)
+MSTEP_PAIR_CUTOFF = 1e-8         # pairs with w below this are left out of the M-step sums
+BG_NN = 15
+BG_MIN_BANDWIDTH_KM = 3.0
+INIT_PARAMS = dict(K=0.02, c=0.02, p=1.1, alpha=0.5, d=1.0, gamma=0.4, q=1.7)
+PARAM_NAMES = ["K", "c", "p", "alpha", "d", "gamma", "q"]
+# bounds on z = (log K, log c, p, alpha, log d, gamma, q).  p may be < 1: swarms decay slower than 1/t
+# (the Omori integral is taken over the finite observation window, so p <= 1 is well defined)
+BOUNDS_Z = [(np.log(1e-8), np.log(1e3)), (np.log(1e-5), np.log(10.0)), (0.5, 5.0),
+            (0.0, 3.0), (np.log(1e-3), np.log(1e5)), (0.0, 3.0), (1.001, 5.0)]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 0.  CONFIGURATION  (edit these to taste — kept aligned with seismic_kg_misd.py)
-# ═══════════════════════════════════════════════════════════════════════════════
+def z_from_params(P):
+    return np.array([np.log(P["K"]), np.log(P["c"]), P["p"], P["alpha"], np.log(P["d"]), P["gamma"], P["q"]])
 
-# Per-sequence presets, tuned so each sequence yields a comparable-sized graph
-# despite very different regional completeness magnitudes. Kept identical to
-# the presets in seismic_kg_misd.py so the two graphs are directly comparable.
-SEQUENCE_PRESETS = {
-    "tohoku":   dict(catalogue="jma_tohoku.csv",   mag_min=4.0, out_prefix="tohoku"),
-    "kumamoto": dict(catalogue="jma_kumamoto.csv", mag_min=2.0, out_prefix="kumamoto"),
-    "noto":     dict(catalogue="jma_noto.csv",     mag_min=2.0, out_prefix="noto"),
-}
 
-CATALOGUE_PATH   = "merged_japan_earthquakes.csv"
-OUT_GRAPHML      = "seismic_kg_etas.graphml"
-OUT_EDGE_CSV     = "seismic_kg_etas_edges.csv"
-OUT_NODE_CSV     = "seismic_kg_etas_nodes.csv"
-OUT_PARAMS_CSV   = "seismic_kg_etas_params.csv"
+def params_from_z(z):
+    return dict(K=float(np.exp(z[0])), c=float(np.exp(z[1])), p=float(z[2]), alpha=float(z[3]),
+                d=float(np.exp(z[4])), gamma=float(z[5]), q=float(z[6]))
 
-# -- Catalogue filter (identical defaults to the MISD script) ------------------
-MAG_MIN          = 4.5          # only keep M >= this (magnitude of completeness proxy)
-DATE_START       = "1900-01-01"
-DATE_END         = "2030-12-31"
-MAX_EVENTS       = 8000         # safety cap; dense NxN matrix at 8000 events ~ 512MB
 
-# -- ETAS EM hyper-parameters ---------------------------------------------------
-ETAS_MAX_ITER    = 30           # outer EM iterations
-ETAS_TOL         = 1e-4         # convergence threshold (relative change in log-lik)
-BG_BANDWIDTH_NN  = 15           # adaptive background KDE: bandwidth = dist to k-th NN
-ETAS_OPTIMIZER_MAXITER = 20     # L-BFGS-B iterations per M-step. The M-step likelihood
-                                 # is evaluated over up to O(N^2) pairs and scipy's
-                                 # finite-difference gradient needs ~8 evals/iteration
-                                 # (7 free params), so this bounds worst-case per-M-step
-                                 # cost. Raise this (e.g. 50-100) for a more precise fit
-                                 # once you're running outside an interactive session
-                                 # with no wall-clock constraint.
+class ETAS:
+    def __init__(self, times, x, y, mags, mc, background, bg_rate, area,
+                 max_iter=ETAS_MAX_ITER, tol=ETAS_TOL, optimizer_maxiter=ETAS_OPTIMIZER_MAXITER,
+                 init_params=None, bg_nn=BG_NN, bg_min_bw_km=BG_MIN_BANDWIDTH_KM):
+        self.N = len(times)
+        self.times = np.asarray(times, float)
+        self.x_km, self.y_km = np.asarray(x, float), np.asarray(y, float)
+        self.mags = np.asarray(mags, float)
+        self.xm = self.mags - mc                     # magnitude above the cutoff
+        self.mc = mc
+        self.background, self.bg_rate, self.area = background, bg_rate, area
+        self.T_span = max(self.times.max() - self.times.min(), 1e-6)
+        self.T_end = self.times.max()
+        self.max_iter, self.tol, self.optimizer_maxiter = max_iter, tol, optimizer_maxiter
+        self.bg_nn, self.bg_min_bw = bg_nn, bg_min_bw_km
+        self.params = dict(INIT_PARAMS)
+        if init_params:
+            self.params.update(init_params)
 
-# -- ETAS parameter initial values ----------------------------------------------
-# lambda(t,x,y) = mu(x,y)
-#   + sum_{i: t_i<t} K * 10^(alpha*(m_i - mc)) * (t-t_i+c)^(-p)
-#                       * (q-1)/(pi*d_i) * (1 + r_ij^2/d_i)^(-q)
-#   with d_i = d * 10^(gamma*(m_i - mc))
-INIT_PARAMS = dict(
-    K      = 0.05,     # productivity scale
-    c      = 0.01,     # Omori time offset [days]
-    p      = 1.1,      # Omori decay exponent
-    alpha  = 1.0,      # magnitude-productivity exponent
-    d      = 0.02,      # spatial scale at m = mc [deg^2]
-    gamma  = 0.5,       # magnitude scaling of spatial extent
-    q      = 1.5,       # spatial decay exponent (q>1 required)
-)
-MC = MAG_MIN            # magnitude cutoff used inside the productivity/spatial terms
+        N = self.N
+        self._causal = np.triu(np.ones((N, N), dtype=bool), k=1)
+        dt = -np.subtract.outer(self.times, self.times)          # t_j - t_i
+        dx = np.subtract.outer(self.x_km, self.x_km)
+        dr2 = dx * dx
+        del dx
+        dy = np.subtract.outer(self.y_km, self.y_km)
+        dr2 += dy * dy
+        del dy
+        dt[~self._causal] = 0.0
+        dr2[~self._causal] = 0.0
+        self._dt, self._dr2 = dt, dr2
+        if background == "kde":
+            self._build_kde_kernel()
+        self.W = None
+        self.w_bg = None
+        self.trace = []
 
-# -- Graph edge threshold (identical semantics to the MISD script) -------------
-W_THRESHOLD      = 0.05
+    # ── background ─────────────────────────────────────────────────────────────
 
-# -- Visualisation ---------------------------------------------------------------
-VIZ_SEED_NODE    = None
-VIZ_HOP_RADIUS   = 2
-VIZ_MIN_MAG      = 5.5
-VIZ_MAX_NODES    = 150          # cap ego-network size for readability
+    def _build_kde_kernel(self):
+        N = self.N
+        xy = np.column_stack([self.x_km, self.y_km])
+        k = min(self.bg_nn, N - 1)
+        kern = np.empty((N, N), dtype=np.float32)
+        for s in range(0, N, 1000):
+            D = cdist(xy[s:s + 1000], xy)
+            h = np.maximum(np.partition(D, k, axis=1)[:, k], self.bg_min_bw)
+            kern[s:s + 1000] = (np.exp(-0.5 * (D / h[:, None]) ** 2) / (2 * np.pi * h[:, None] ** 2)).astype(np.float32)
+        self._kern = kern
+
+    def _background_rate(self, w_bg):
+        """mu_j [events/day/km^2] and the integral of mu over space and time (expected background count)."""
+        if self.background == "fixed":
+            return np.full(self.N, self.bg_rate), self.bg_rate * self.T_span * self.area
+        mu = (w_bg.astype(np.float32) @ self._kern).astype(float) / self.T_span
+        return np.maximum(mu, 1e-15), float(w_bg.sum())
+
+    # ── model pieces ───────────────────────────────────────────────────────────
+
+    def _rate_matrix(self, P=None):
+        """R[i,j] = triggering intensity at event j due to event i (i<j), events/day/km^2."""
+        P = P or self.params
+        rho = P["K"] * 10.0 ** (P["alpha"] * self.xm)
+        d_i = P["d"] * 10.0 ** (P["gamma"] * self.xm)
+        R = (self._dt + P["c"]) ** (-P["p"])
+        R *= (P["q"] - 1.0) / (np.pi * d_i[:, None]) * (1.0 + self._dr2 / d_i[:, None]) ** (-P["q"])
+        R *= rho[:, None]
+        R[~self._causal] = 0.0
+        return R
+
+    def _omori_terms(self, c, p):
+        """Omega_i = int_c^{tau_i + c} t^(-p) dt and its derivatives w.r.t. c and p.
+        Stable for p < 1, p = 1 and p > 1 (series expansion in s = 1 - p near p = 1)."""
+        tau = np.maximum(self.T_end - self.times, 0.0)
+        b = tau + c
+        A, B = np.log(c), np.log(b)
+        s = 1.0 - p
+        if abs(s) < 1e-4:
+            om = (B - A) + s * (B ** 2 - A ** 2) / 2 + s ** 2 * (B ** 3 - A ** 3) / 6 + s ** 3 * (B ** 4 - A ** 4) / 24
+            dom_ds = (B ** 2 - A ** 2) / 2 + s * (B ** 3 - A ** 3) / 3 + s ** 2 * (B ** 4 - A ** 4) / 8
+        else:
+            eA, eB = np.exp(s * A), np.exp(s * B)                      # c^s, b^s
+            om = (eB - eA) / s
+            dom_ds = (B * eB - A * eA) / s - (eB - eA) / s ** 2
+        return om, -c ** (-p) + b ** (-p), -dom_ds
+
+    def _compensator(self, P):
+        om = self._omori_terms(P["c"], P["p"])[0]
+        return float((P["K"] * 10.0 ** (P["alpha"] * self.xm) * om).sum())
+
+    def _estep(self, mu):
+        R = self._rate_matrix()
+        tot = mu + R.sum(axis=0)
+        self.w_bg = mu / tot
+        self.W = R / tot[None, :]
+        return tot
+
+    # ── M-step for (K, c, p, alpha, d, gamma, q): weighted MLE with analytic gradient ──
+
+    def _fg(self, z, data):
+        """Negative restricted log-likelihood and its exact gradient w.r.t. z, scaled by 1/sum(w)."""
+        w, dt, dr2, xk, Wsum, Wx = data
+        K, c, p, a, d, g, q = (np.exp(z[0]), np.exp(z[1]), z[2], z[3], np.exp(z[4]), z[5], z[6])
+        dk = d * 10.0 ** (g * xk)
+        u = dr2 / dk
+        l1p = np.log1p(u)
+        ldt = np.log(dt + c)
+        L1 = (Wsum * (np.log(K) + np.log(q - 1.0) - np.log(np.pi) - np.log(d))
+              + LN10 * (a - g) * Wx - p * (w @ ldt) - q * (w @ l1p))
+        r = u / (1.0 + u)
+        gK, ga = Wsum / K, LN10 * Wx
+        gc = -p * (w @ (1.0 / (dt + c)))
+        gp = -(w @ ldt)
+        gq = Wsum / (q - 1.0) - (w @ l1p)
+        gd = -Wsum / d + (q / d) * (w @ r)
+        gg = LN10 * (-Wx + q * ((w * xk) @ r))
+        # compensator  C = sum_i rho_i * Omega_i(c, p)
+        rho = K * 10.0 ** (a * self.xm)
+        om, dom_dc, dom_dp = self._omori_terms(c, p)
+        Cc = float(rho @ om)
+        gCK, gCa = Cc / K, LN10 * float((self.xm * rho) @ om)
+        gCc, gCp = float(rho @ dom_dc), float(rho @ dom_dp)
+        f = -(L1 - Cc)
+        gnat = -np.array([gK - gCK, gc - gCc, gp - gCp, ga - gCa, gd, gg, gq])
+        gz = np.array([gnat[0] * K, gnat[1] * c, gnat[2], gnat[3], gnat[4] * d, gnat[5], gnat[6]])
+        return f / Wsum, gz / Wsum
+
+    def _mstep_triggering(self):
+        ii, jj = np.where(self.W > MSTEP_PAIR_CUTOFF)
+        if len(ii) == 0:
+            log.warning("No significant triggering pairs; M-step skipped.")
+            return {}
+        w = self.W[ii, jj]
+        data = (w, self._dt[ii, jj], self._dr2[ii, jj], self.xm[ii], float(w.sum()), float(w @ self.xm[ii]))
+        res = minimize(self._fg, z_from_params(self.params), args=(data,), jac=True, method="L-BFGS-B",
+                       bounds=BOUNDS_Z, options=dict(maxiter=self.optimizer_maxiter, ftol=1e-12, gtol=1e-8))
+        self.params = params_from_z(res.x)
+        return dict(opt_nit=int(res.nit), opt_nfev=int(res.nfev), opt_success=bool(res.success))
+
+    # ── EM driver ──────────────────────────────────────────────────────────────
+
+    def fit(self):
+        log.info("Starting ETAS EM  (N=%d, background=%s%s, max_iter=%d)", self.N, self.background,
+                 f" @ {self.bg_rate:.3e}/day/km^2" if self.background == "fixed" else "", self.max_iter)
+        w_bg0 = np.full(self.N, 0.1)
+        mu, n0 = self._background_rate(w_bg0)
+        ll_prev, self.converged, t_start = None, False, time.time()
+        for it in range(self.max_iter):
+            tot = self._estep(mu)
+            ll = float(np.log(tot).sum() - n0 - self._compensator(self.params))
+            rel = np.inf if ll_prev is None else abs(ll - ll_prev) / (abs(ll_prev) + 1e-12)
+            row = dict(iteration=it + 1, loglik=ll, rel_change=rel, bg_mass=float(self.w_bg.sum()),
+                       seconds=round(time.time() - t_start, 1), **self.params)
+            self.trace.append(row)
+            log.info("  Iter %3d  loglik=%.3f  rel=%.1e  K=%.4g c=%.4g p=%.3f alpha=%.3f d=%.4g gamma=%.3f q=%.3f  bg_mass=%.1f",
+                     it + 1, ll, rel, self.params["K"], self.params["c"], self.params["p"], self.params["alpha"],
+                     self.params["d"], self.params["gamma"], self.params["q"], self.w_bg.sum())
+            if ll_prev is not None and rel < self.tol:
+                self.converged = True
+                log.info("Converged at iteration %d.", it + 1)
+                break
+            ll_prev = ll
+            if self.background == "kde":
+                mu, n0 = self._background_rate(self.w_bg)
+            row.update(self._mstep_triggering())
+        if not self.converged:
+            # make the saved probabilities consistent with the final parameters
+            tot = self._estep(mu)
+            ll = float(np.log(tot).sum() - n0 - self._compensator(self.params))
+            self.trace.append(dict(iteration=len(self.trace) + 1, loglik=ll, rel_change=np.nan,
+                                   bg_mass=float(self.w_bg.sum()), seconds=round(time.time() - t_start, 1),
+                                   **self.params))
+            log.warning("Reached max_iter=%d without meeting tol=%.0e; final E-step run with the final parameters.",
+                        self.max_iter, self.tol)
+        self.mu, self.n0 = mu, n0
+        log.info("ETAS fit complete.  Final params: %s", {k: float(f"{v:.4g}") for k, v in self.params.items()})
+        return self
+
+    # ── outputs ────────────────────────────────────────────────────────────────
+
+    def verify(self):
+        """Probability checks (thesis 5.4) + consistency of the stored W with the final parameters."""
+        W = self.W
+        res = C.verify_probabilities(self.w_bg, W.sum(axis=0), float(W.min()),
+                                     int(np.count_nonzero(W[~self._causal])),
+                                     int(np.count_nonzero(~np.isfinite(W))))
+        R = self._rate_matrix()
+        W2 = R / (self.mu + R.sum(axis=0))[None, :]
+        res["max_abs_diff_vs_final_params"] = float(np.abs(W2 - W).max())
+        res["consistent_with_final_params"] = res["max_abs_diff_vs_final_params"] < 1e-9
+        res["all_passed"] = bool(res["all_passed"] and res["consistent_with_final_params"])
+        return res
+
+    def pair_arrays(self, cutoff):
+        ii, jj = np.where(self.W >= cutoff)
+        return ii, jj, self.W[ii, jj]
+
+
+def plot_trace(etas, out_png):
+    tr = pd.DataFrame(etas.trace)
+    fig, ax = plt.subplots(2, 4, figsize=(17, 6.5))
+    ax = ax.ravel()
+    ax[0].plot(tr.iteration, tr.loglik, "o-", color="#2979ff")
+    ax[0].set(title="log-likelihood (true, incl. compensator)", xlabel="EM iteration")
+    for a, name in zip(ax[1:], PARAM_NAMES):
+        a.plot(tr.iteration, tr[name], "o-", color="#2979ff")
+        a.set(title=name, xlabel="EM iteration")
+        if name in ("K", "c", "d"):
+            a.set_yscale("log")
+    for a in ax:
+        a.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close(fig)
 
 
 def parse_cli_args():
-    p = argparse.ArgumentParser(description="Build an ETAS seismic family-tree graph.")
-    p.add_argument("--preset", choices=SEQUENCE_PRESETS.keys(),
-                    help="Use a built-in (catalogue, mag_min, out_prefix) combo for one of the case studies")
-    p.add_argument("--catalogue", help="Path to the extracted sequence CSV (overrides --preset)")
-    p.add_argument("--mag-min", type=float, help="Completeness magnitude cutoff (overrides --preset)")
-    p.add_argument("--max-events", type=int, default=MAX_EVENTS)
-    p.add_argument("--out-prefix", help="Prefix for output files, e.g. 'kumamoto' -> kumamoto_kg.graphml")
-    p.add_argument("--etas-max-iter", type=int, default=ETAS_MAX_ITER,
-                    help="Outer EM iterations (default: %(default)s). This is the single "
-                         "biggest runtime lever -- each iteration includes an O(N^2) "
-                         "numerical MLE M-step.")
-    p.add_argument("--optimizer-maxiter", type=int, default=ETAS_OPTIMIZER_MAXITER,
-                    help="L-BFGS-B iterations per M-step (default: %(default)s). Raise "
-                         "for a more precise fit once running with no time constraint "
-                         "(e.g. 50-100); lower for a fast smoke test (e.g. 3-5).")
+    p = argparse.ArgumentParser(description="Build an ETAS seismic family-tree graph (v2).")
+    p.add_argument("--preset", choices=C.SEQUENCE_PRESETS.keys(), help="case study: catalogue, Mc, prefix and imposed background rate")
+    p.add_argument("--catalogue", help="extracted sequence CSV (overrides --preset)")
+    p.add_argument("--mag-min", type=float, help="completeness magnitude (overrides --preset)")
+    p.add_argument("--max-events", type=int, default=C.MAX_EVENTS)
+    p.add_argument("--out-prefix", help="prefix for output files (default: preset name)")
+    p.add_argument("--out-dir", default="results", help="output folder (created if missing; default: results)")
+    p.add_argument("--background", choices=["fixed", "kde"], help="fixed = impose --bg-rate (default with a preset); kde = estimate")
+    p.add_argument("--bg-rate", type=float, help="imposed background rate [events/day/km^2] (overrides the preset's)")
+    p.add_argument("--etas-max-iter", type=int, default=ETAS_MAX_ITER)
+    p.add_argument("--optimizer-maxiter", type=int, default=ETAS_OPTIMIZER_MAXITER)
+    p.add_argument("--tol", type=float, default=ETAS_TOL)
     return p.parse_args()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 1.  LOAD & FILTER CATALOGUE   (identical logic to seismic_kg_misd.py)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def load_catalogue(path: str, mag_min: float = MAG_MIN,
-                    max_events: int = MAX_EVENTS) -> pd.DataFrame:
-    df = pd.read_csv(path, low_memory=False)
-
-    df["datetime"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-    df = df.dropna(subset=["datetime", "latitude", "longitude", "depth", "mag"])
-
-    # -- Magnitude determination method ---------------------------------------
-    # JMA extracts carry a magType column: 'V' (velocity-type) vs 'D'
-    # (displacement-type) are BOTH native JMA-scale (Mj) magnitudes, not
-    # different scales -- JMA switches determination method as magnitude
-    # grows (velocity-type saturates for large ruptures), so V and D are
-    # strongly correlated with event size. Filtering to 'V' only silently
-    # discards most of the largest events in a sequence -- do NOT do that.
-    # Only genuinely missing/unparseable magType rows are dropped here.
-    if "magType" in df.columns:
-        n_before = len(df)
-        df = df.dropna(subset=["magType"])
-        n_dropped = n_before - len(df)
-        if n_dropped:
-            log.info("Dropped %d events with missing magType.", n_dropped)
-
-    df = df[df["mag"] >= mag_min]
-    df = df[df["datetime"] >= pd.Timestamp(DATE_START, tz="UTC")]
-    df = df[df["datetime"] <= pd.Timestamp(DATE_END,   tz="UTC")]
-    df = df.sort_values("datetime").reset_index(drop=True)
-
-    if len(df) > max_events:
-        log.warning("Catalogue has %d events above M%.1f; capping at %d for ETAS. "
-                    "Consider raising mag_min instead of truncating in time.",
-                    len(df), mag_min, max_events)
-        df = df.iloc[:max_events].copy()
-
-    log.info("Catalogue loaded: %d events  (M%.1f+, %s - %s)",
-             len(df), mag_min, DATE_START, DATE_END)
-    return df
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 2.  ETAS MODEL + STOCHASTIC-DECLUSTERING EM
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class ETAS:
-    """
-    Space-time ETAS fitted by the Zhuang/Ogata/Vere-Jones stochastic
-    declustering EM algorithm.
-
-    Parameters
-    ----------
-    times, lats, lons, mags : arrays of shape (N,)
-    mc      : magnitude cutoff used in productivity & spatial-scale terms
-    T_span  : total observation duration in days (for background-rate MLE)
-    domain_area : study-area size in deg^2 (for background-rate MLE)
-    """
-
-    def __init__(self, times, lats, lons, mags, mc=MC,
-                 init_params=None, max_iter=ETAS_MAX_ITER, tol=ETAS_TOL,
-                 bg_bandwidth_nn=BG_BANDWIDTH_NN, optimizer_maxiter=ETAS_OPTIMIZER_MAXITER):
-
-        self.N = len(times)
-        self.times = np.asarray(times, dtype=float)
-        self.lats  = np.asarray(lats,  dtype=float)
-        self.lons  = np.asarray(lons,  dtype=float)
-        self.mags  = np.asarray(mags,  dtype=float)
-        self.mc    = mc
-
-        p0 = dict(INIT_PARAMS)
-        if init_params:
-            p0.update(init_params)
-        self.params = p0          # K, c, p, alpha, d, gamma, q
-        self.max_iter = max_iter
-        self.tol = tol
-        self.bg_bandwidth_nn = bg_bandwidth_nn
-        self.optimizer_maxiter = optimizer_maxiter
-
-        # pairwise (i<j) time & space separations, precomputed once
-        self._dt = np.zeros((self.N, self.N))
-        self._dr2 = np.zeros((self.N, self.N))
-        for j in range(1, self.N):
-            self._dt[:j, j]  = self.times[j] - self.times[:j]
-            self._dr2[:j, j] = ((self.lats[j]  - self.lats[:j])**2 +
-                                 (self.lons[j]  - self.lons[:j])**2)
-
-        self.W     = np.zeros((self.N, self.N))   # triggering probabilities
-        self.w_bg  = np.ones(self.N) / self.N      # background probabilities
-        self.mu    = np.full(self.N, 1.0 / self.N)  # background intensity at each event's location
-        self._bg_bandwidth = np.full(self.N, 1.0)   # adaptive KDE bandwidths (deg)
-
-        self.loglik_history = []
-
-    # ── ETAS kernel pieces ──────────────────────────────────────────────────────
-
-    def _productivity(self, i_idx):
-        K, alpha = self.params["K"], self.params["alpha"]
-        return K * 10.0 ** (alpha * (self.mags[i_idx] - self.mc))
-
-    def _spatial_scale(self, i_idx):
-        d, gamma = self.params["d"], self.params["gamma"]
-        return d * 10.0 ** (gamma * (self.mags[i_idx] - self.mc))
-
-    def _triggering_density(self, dt, dr2, d_i, m_i_scalar_idx=None):
-        """
-        Raw (unnormalised-in-i) space-time triggering intensity contributed
-        by a parent at temporal lag dt >= 0 and squared spatial lag dr2,
-        given that parent's spatial scale d_i.
-          Omori-Utsu(dt) x GR-productivity x long-tailed spatial kernel
-        """
-        c, p, q = self.params["c"], self.params["p"], self.params["q"]
-        temporal = (dt + c) ** (-p)
-        spatial  = (q - 1.0) / (np.pi * d_i) * (1.0 + dr2 / d_i) ** (-q)
-        return temporal * spatial
-
-    def _rate_matrix(self):
-        """
-        Vectorised computation of the full (N, N) triggering-rate matrix.
-        R[i,j] = productivity(i) * triggering_density(dt_ij, dr_ij^2 ; d_i)
-        for i < j (causal), 0 otherwise. Shape (N, N).
-
-        Replaces a Python-level loop over j (with per-j slicing) with
-        NumPy broadcasting -- self._dt / self._dr2 are precomputed once in
-        __init__, so each EM iteration's rate-matrix rebuild (needed
-        because rho/d_i change every M-step) is now a handful of array
-        ops instead of N Python-level iterations.
-        """
-        rho = self._productivity(np.arange(self.N))          # (N,)
-        d_i = self._spatial_scale(np.arange(self.N))          # (N,)
-        c, p, q = self.params["c"], self.params["p"], self.params["q"]
-
-        temporal = (self._dt + c) ** (-p)                              # (N,N)
-        spatial  = (q - 1.0) / (np.pi * d_i[:, None]) * (1.0 + self._dr2 / d_i[:, None]) ** (-q)
-        R = rho[:, None] * temporal * spatial
-
-        # exact causal mask: i < j (matches the original loop's range(j) semantics)
-        causal = np.triu(np.ones((self.N, self.N), dtype=bool), k=1)
-        R[~causal] = 0.0
-        return R
-
-    # ── background intensity: adaptive Gaussian KDE, weighted by w_bg ──────────
-
-    def _update_background(self):
-        """
-        Re-estimate the spatially-variable background rate mu(x,y) via a
-        variable-bandwidth Gaussian KDE over event locations, each event
-        weighted by its current background probability w_bg[j] (Zhuang et
-        al. 2002, sec. 3). Bandwidth at each point = distance to its
-        bg_bandwidth_nn-th nearest neighbour (adaptive smoothing: sparser
-        regions get wider kernels).
-
-        Vectorised: the original Python loop over j (each iteration doing
-        an O(N) kernel evaluation) is replaced by one (N,N) kernel matrix
-        and a single weighted sum (matrix-vector product).
-        """
-        coords = np.column_stack([self.lats, self.lons])
-        D = cdist(coords, coords)
-        k = min(self.bg_bandwidth_nn, self.N - 1)
-        # k-th nearest-neighbour distance (excluding self) as local bandwidth
-        bw = np.sort(D, axis=1)[:, k]
-        bw = np.maximum(bw, 1e-3)   # floor to avoid degenerate zero-bandwidth
-        self._bg_bandwidth = bw
-
-        # kern[i, j] = Gaussian kernel centred at event i, evaluated at j,
-        # using event i's own adaptive bandwidth bw[i]
-        kern = np.exp(-0.5 * D**2 / bw[:, None]**2) / (2 * np.pi * bw[:, None]**2)
-        mu_new = self.w_bg @ kern   # mu_new[j] = sum_i w_bg[i] * kern[i,j]
-
-        # normalise so that sum(mu) matches expected number of background events
-        target = self.w_bg.sum()
-        cur = mu_new.sum()
-        if cur > 0:
-            mu_new *= target / cur
-        self.mu = mu_new
-
-    # ── weighted MLE for (K, c, p, alpha, d, gamma, q) given current W ─────────
-
-    def _negloglik_triggering(self, theta, w, dt, dr2, m_i):
-        """
-        Weighted negative log-likelihood of the Omori/GR/spatial triggering
-        kernel, treating each (i,j) pair with i<j as a weighted observation
-        with weight W[i,j] = current E-step probability that j was
-        triggered by i. This is the standard "restricted likelihood" used
-        for the ETAS M-step (Zhuang, 2011): it is proportional to the true
-        space-time ETAS log-likelihood's triggering term when W already
-        reflects the correct posterior, which holds at the EM fixed point.
-
-        Takes pre-extracted sparse pair arrays (w, dt, dr2, m_i) rather
-        than re-filtering the full (N,N) W matrix on every call -- the
-        optimizer calls this hundreds of times per M-step (one per
-        finite-difference gradient component), and re-scanning millions
-        of matrix entries every single call was the dominant cost.
-        """
-        K, c, p, alpha, d, gamma, q = theta
-        if K <= 0 or c <= 0 or p <= 1.0 or d <= 0 or q <= 1.0:
-            return 1e12
-        if len(w) == 0:
-            return 1e12
-
-        rho = K * 10.0 ** (alpha * (m_i - self.mc))
-        d_i = d * 10.0 ** (gamma * (m_i - self.mc))
-
-        log_rho      = np.log(rho + 1e-300)
-        log_temporal = -p * np.log(dt + c)
-        log_spatial  = (np.log(q - 1.0) - np.log(np.pi * d_i)
-                        - q * np.log(1.0 + dr2 / d_i))
-
-        ll = np.sum(w * (log_rho + log_temporal + log_spatial))
-
-        # compensator (integral) term -- O(N), not O(pairs), always cheap
-        T_max = self.times.max()
-        rho_all = K * 10.0 ** (alpha * (self.mags - self.mc))
-        time_left = np.maximum(T_max - self.times, 0.0)
-        if abs(p - 1.0) > 1e-6:
-            omori_integral = (c ** (1 - p) - (time_left + c) ** (1 - p)) / (p - 1)
-        else:
-            omori_integral = np.log((time_left + c) / c)
-        compensator = np.sum(rho_all * omori_integral)
-
-        return -(ll - compensator)
-
-    def _update_triggering_params(self, optimizer_maxiter=20):
-        # Extract the sparse (i,j) pairs ONCE per M-step call, not once per
-        # objective-function evaluation (see _negloglik_triggering docstring).
-        idx_i, idx_j = np.where(self.W > 1e-12)
-        if len(idx_i) == 0:
-            log.warning("  No significant triggering pairs (W all ~0); skipping M-step (b).")
-            return
-        w   = self.W[idx_i, idx_j]
-        dt  = self._dt[idx_i, idx_j]
-        dr2 = self._dr2[idx_i, idx_j]
-        m_i = self.mags[idx_i]
-
-        theta0 = np.array([self.params["K"], self.params["c"], self.params["p"],
-                            self.params["alpha"], self.params["d"],
-                            self.params["gamma"], self.params["q"]])
-        bounds = [(1e-6, None), (1e-5, None), (1.001, 5.0),
-                  (0.01, 5.0), (1e-6, None), (0.0, 3.0), (1.001, 5.0)]
-        res = minimize(self._negloglik_triggering, theta0, args=(w, dt, dr2, m_i),
-                        method="L-BFGS-B", bounds=bounds,
-                        options=dict(maxiter=optimizer_maxiter))
-        if res.success or res.status in (0, 1, 2):
-            K, c, p, alpha, d, gamma, q = res.x
-            self.params.update(K=K, c=c, p=p, alpha=alpha, d=d, gamma=gamma, q=q)
-        else:
-            log.warning("  M-step optimiser did not fully converge (%s); keeping previous params.",
-                        res.message)
-
-    # ── total observed-data log-likelihood (for convergence tracking) ──────────
-
-    def _total_loglik(self, R):
-        lam = self.mu + R.sum(axis=0)
-        lam = np.maximum(lam, 1e-300)
-        # point-process log-likelihood ~ sum(log lambda_j) - integral(lambda)
-        # (integral term omitted from the tracked value since it is ~constant
-        #  across iterations at convergence; used only to monitor progress)
-        return np.sum(np.log(lam))
-
-    # ── EM driver ────────────────────────────────────────────────────────────
-
-    def fit(self):
-        log.info("Starting ETAS stochastic-declustering EM  (N=%d, max_iter=%d)",
-                 self.N, self.max_iter)
-        if self.N > 8000:
-            log.warning("N=%d is large for a dense (N,N) matrix (%.1f GB as float64). "
-                         "Consider raising mc to shrink the catalogue.",
-                         self.N, 8 * self.N**2 / 1e9)
-        log.info("Initial params: %s", self.params)
-
-        prev_ll = -np.inf
-        for iteration in range(self.max_iter):
-
-            # ── E-step (vectorised): rate matrix + normalised weights ───────
-            R = self._rate_matrix()
-            beta_sum = R.sum(axis=0)               # shape (N,), sum over i<j
-            total = self.mu + beta_sum
-            safe_total = np.where(total <= 0, 1.0, total)
-
-            self.w_bg = np.where(total <= 0, 1.0, self.mu / safe_total)
-            self.W = R / safe_total[np.newaxis, :]
-            self.W[:, total <= 0] = 0.0
-
-            ll = self._total_loglik(R)
-            self.loglik_history.append(ll)
-            rel_change = abs(ll - prev_ll) / (abs(prev_ll) + 1e-12) if iteration > 0 else np.inf
-
-            log.info("  Iter %3d  loglik=%.3f  Δ=%.2e  K=%.4f c=%.4f p=%.3f "
-                     "alpha=%.3f d=%.4f gamma=%.3f q=%.3f  bg_frac=%.3f",
-                     iteration + 1, ll, rel_change,
-                     self.params["K"], self.params["c"], self.params["p"],
-                     self.params["alpha"], self.params["d"], self.params["gamma"],
-                     self.params["q"], self.w_bg.mean())
-
-            if iteration > 0 and rel_change < self.tol:
-                log.info("Converged at iteration %d.", iteration + 1)
-                break
-
-            # ── M-step (a): background intensity ─────────────────────────────
-            self._update_background()
-
-            # ── M-step (b): triggering kernel parameters ─────────────────────
-            self._update_triggering_params(optimizer_maxiter=self.optimizer_maxiter)
-
-            prev_ll = ll
-
-        self.R = self._rate_matrix()
-        log.info("ETAS fit complete.  Final params: %s", self.params)
-        return self
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 3.  BUILD THE KNOWLEDGE GRAPH   (identical logic/semantics to seismic_kg_misd.py)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def build_knowledge_graph(df: pd.DataFrame, etas: ETAS,
-                          threshold: float = W_THRESHOLD) -> nx.DiGraph:
-    """
-    Construct a directed graph where:
-      - Nodes = earthquake events (attributes: time, lat, lon, depth, mag, id)
-      - Edges = triggering relationships with weight w[i,j] >= threshold
-      - Edge type: 'direct' or 'indirect' (cascade)
-
-    An edge i->j is labelled 'indirect' if there exists at least one
-    intermediate node k such that w[i,k] >= threshold AND w[k,j] >= threshold.
-    """
-    G = nx.DiGraph()
-
-    for idx, row in df.iterrows():
-        G.add_node(idx,
-                   time      = str(row["datetime"]),
-                   latitude  = float(row["latitude"]),
-                   longitude = float(row["longitude"]),
-                   depth     = float(row["depth"]),
-                   mag       = float(row["mag"]),
-                   event_id  = str(row.get("id", f"evt_{idx}")),
-                   is_background = float(etas.w_bg[idx]))
-
-    rows_i, cols_j = np.where(etas.W >= threshold)
-    for i, j in zip(rows_i, cols_j):
-        if i >= j:
-            continue
-        G.add_edge(int(i), int(j),
-                   weight    = float(etas.W[i, j]),
-                   edge_type = "direct")
-
-    log.info("Labelling cascade (indirect) edges ...")
-    for i, j in list(G.edges()):
-        intermediates = set(G.successors(i)) & set(G.predecessors(j))
-        if intermediates:
-            G[i][j]["edge_type"] = "indirect"
-            # GraphML doesn't support list-valued attributes -- store as a
-            # comma-separated string instead.
-            G[i][j]["via"] = ",".join(str(k) for k in list(intermediates)[:5])
-
-    n_direct   = sum(1 for _, _, d in G.edges(data=True) if d["edge_type"] == "direct")
-    n_indirect = sum(1 for _, _, d in G.edges(data=True) if d["edge_type"] == "indirect")
-    log.info("Graph built:  %d nodes  |  %d edges  (%d direct, %d indirect)",
-             G.number_of_nodes(), G.number_of_edges(), n_direct, n_indirect)
-    return G
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4.  EXPORT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def export_graph(G: nx.DiGraph, df: pd.DataFrame, etas: ETAS,
-                 out_graphml=None, out_edge_csv=None, out_node_csv=None, out_params_csv=None):
-    out_graphml    = out_graphml or OUT_GRAPHML
-    out_edge_csv   = out_edge_csv or OUT_EDGE_CSV
-    out_node_csv   = out_node_csv or OUT_NODE_CSV
-    out_params_csv = out_params_csv or OUT_PARAMS_CSV
-
-    nx.write_graphml(G, out_graphml)
-    log.info("GraphML saved -> %s", out_graphml)
-
-    edge_rows = []
-    for i, j, data in G.edges(data=True):
-        edge_rows.append({
-            "source_idx":   i,
-            "target_idx":   j,
-            "weight":       data["weight"],
-            "edge_type":    data["edge_type"],
-            "source_time":  df.loc[i, "datetime"],
-            "target_time":  df.loc[j, "datetime"],
-            "source_mag":   df.loc[i, "mag"],
-            "target_mag":   df.loc[j, "mag"],
-        })
-    pd.DataFrame(edge_rows).to_csv(out_edge_csv, index=False)
-    log.info("Edge CSV saved -> %s", out_edge_csv)
-
-    node_rows = []
-    for node, data in G.nodes(data=True):
-        node_rows.append({"idx": node, **data})
-    pd.DataFrame(node_rows).to_csv(out_node_csv, index=False)
-    log.info("Node CSV saved -> %s", out_node_csv)
-
-    # Fitted ETAS parameters + convergence trace (useful for the thesis
-    # write-up / appendix and for comparison against literature values)
-    params_row = dict(etas.params)
-    params_row["mc"] = etas.mc
-    params_row["n_events"] = etas.N
-    params_row["final_loglik"] = etas.loglik_history[-1] if etas.loglik_history else None
-    params_row["n_em_iterations"] = len(etas.loglik_history)
-    pd.DataFrame([params_row]).to_csv(out_params_csv, index=False)
-    log.info("Fitted parameters saved -> %s", out_params_csv)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 5.  VISUALISE A SUBGRAPH   (identical styling to seismic_kg_misd.py)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def visualise_subgraph(G: nx.DiGraph, df: pd.DataFrame,
-                       seed_idx=None, hops=VIZ_HOP_RADIUS, out_prefix="seismic_kg_etas",
-                       max_nodes=VIZ_MAX_NODES):
-    """
-    Plot the ego-network around the highest-magnitude event (or seed_idx).
-    Node size ∝ magnitude.  Edge colour: blue=direct, orange=indirect.
-
-    Layout: aftershock zones and swarms pack many events into a tiny
-    geographic footprint, so plotting raw (longitude, latitude) as node
-    positions causes heavy overlap. We seed a force-directed layout with
-    the geographic positions (so the plot still roughly reflects real
-    spatial structure) and let a short relaxation pull apart nodes that
-    would otherwise stack on top of each other. If the ego-network is
-    still very large, it's trimmed to the highest-magnitude nodes so the
-    plot stays legible. (Identical approach to seismic_kg_misd.py.)
-    """
-    if seed_idx is None:
-        candidates = [n for n in G.nodes() if G.out_degree(n) > 0
-                      and df.loc[n, "mag"] >= VIZ_MIN_MAG]
-        if not candidates:
-            candidates = list(G.nodes())
-        seed_idx = max(candidates, key=lambda n: df.loc[n, "mag"])
-
-    log.info("Visualising ego-network around node %d  (M%.1f, %s)",
-             seed_idx, df.loc[seed_idx, "mag"], df.loc[seed_idx, "datetime"])
-
-    ego_nodes = {seed_idx}
-    frontier  = {seed_idx}
-    for _ in range(hops):
-        next_frontier = set()
-        for n in frontier:
-            next_frontier |= set(G.successors(n)) | set(G.predecessors(n))
-        ego_nodes |= next_frontier
-        frontier = next_frontier
-        if len(ego_nodes) > max_nodes * 4:
-            log.info("Ego network growing very large (%d nodes); stopping hop "
-                      "expansion early.", len(ego_nodes))
-            break
-
-    if len(ego_nodes) > max_nodes:
-        log.info("Ego network has %d nodes; trimming to the top %d by magnitude "
-                  "(plus seed) for readability. Full graph is still in the "
-                  "exported GraphML/CSV -- this only affects this one plot.",
-                  len(ego_nodes), max_nodes)
-        ranked = sorted(ego_nodes, key=lambda n: df.loc[n, "mag"], reverse=True)
-        ego_nodes = set(ranked[:max_nodes]) | {seed_idx}
-
-    sub = G.subgraph(ego_nodes).copy()
-    n_nodes = sub.number_of_nodes()
-
-    geo_pos = {n: (df.loc[n, "longitude"], df.loc[n, "latitude"]) for n in sub.nodes()}
-    k_spacing = 0.5 / max(n_nodes, 1) ** 0.5
-    pos = nx.spring_layout(sub, pos=geo_pos, k=k_spacing, iterations=150, seed=42)
-
-    sizes = [22 * (df.loc[n, "mag"] ** 2) for n in sub.nodes()]
-
-    edge_colours = ["#2979ff" if d["edge_type"] == "direct" else "#ff6d00"
-                    for _, _, d in sub.edges(data=True)]
-    edge_widths  = [1.8 * d["weight"] + 0.2 for _, _, d in sub.edges(data=True)]
-
-    bg_probs   = [G.nodes[n].get("is_background", 0.5) for n in sub.nodes()]
-    node_cmap  = cm.get_cmap("coolwarm")   # low (triggered) -> blue, high (background) -> red
-    node_colors = [node_cmap(p) for p in bg_probs]
-
-    fig_w = max(12, min(26, 8 + n_nodes / 15))
-    fig_h = max(10, min(22, 7 + n_nodes / 18))
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-    ax.set_facecolor("#0d0d0d")
-    fig.patch.set_facecolor("#0d0d0d")
-
-    nx.draw_networkx_nodes(sub, pos, node_size=sizes,
-                           node_color=node_colors, ax=ax, alpha=0.85)
-    nx.draw_networkx_edges(sub, pos, edge_color=edge_colours,
-                           width=edge_widths, ax=ax, alpha=0.55,
-                           arrows=True, arrowsize=9,
-                           connectionstyle="arc3,rad=0.1")
-
-    labels = {n: f"M{df.loc[n,'mag']:.1f}"
-              for n in sub.nodes() if df.loc[n, "mag"] >= VIZ_MIN_MAG}
-    nx.draw_networkx_labels(sub, pos, labels=labels,
-                            font_color="white", font_size=8, ax=ax)
-
-    from matplotlib.lines import Line2D
-    legend_elements = [
-        Line2D([0],[0], color="#2979ff", lw=2, label="Direct trigger"),
-        Line2D([0],[0], color="#ff6d00", lw=2, label="Indirect (cascade)"),
-    ]
-    ax.legend(handles=legend_elements, loc="upper left",
-              facecolor="#1a1a1a", labelcolor="white", framealpha=0.8)
-
-    ax.set_title(
-        f"ETAS Seismic Family Tree — ego-network around event {seed_idx}  "
-        f"(M{df.loc[seed_idx,'mag']:.1f}, {str(df.loc[seed_idx,'datetime'])[:10]})\n"
-        f"{n_nodes} nodes shown  |  Node colour: background probability (red=background, blue=triggered)",
-        color="white", fontsize=10)
-    ax.tick_params(colors="grey")
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#333")
-    ax.set_axis_off()
-
-    plt.tight_layout()
-    out_png = f"{out_prefix}_etas_subgraph.png"
-    plt.savefig(out_png, dpi=150, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
-    log.info("Subgraph plot saved -> %s", out_png)
-    plt.close(fig)
-
-
-def plot_convergence(etas: ETAS, out_prefix="seismic_kg_etas"):
-    """Quick diagnostic: log-likelihood trace across EM iterations."""
-    if not etas.loglik_history:
-        return
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(range(1, len(etas.loglik_history) + 1), etas.loglik_history,
-            marker="o", color="#2979ff")
-    ax.set_xlabel("EM iteration")
-    ax.set_ylabel("Observed-data log-likelihood (approx.)")
-    ax.set_title("ETAS EM convergence")
-    ax.grid(alpha=0.3)
-    plt.tight_layout()
-    out_png = f"{out_prefix}_etas_convergence.png"
-    plt.savefig(out_png, dpi=150)
-    log.info("Convergence plot saved -> %s", out_png)
-    plt.close(fig)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 6.  MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
-
     args = parse_cli_args()
+    path, mag_min, prefix, bg, rate = C.resolve_config(args, default_model_bg="kde")
+    os.makedirs(args.out_dir, exist_ok=True)
+    out = lambda name: os.path.join(args.out_dir, f"{prefix}_{name}")
 
-    if args.preset:
-        preset = SEQUENCE_PRESETS[args.preset]
-        catalogue_path = args.catalogue or preset["catalogue"]
-        mag_min        = args.mag_min if args.mag_min is not None else preset["mag_min"]
-        out_prefix     = args.out_prefix or preset["out_prefix"]
-    else:
-        catalogue_path = args.catalogue or CATALOGUE_PATH
-        mag_min        = args.mag_min if args.mag_min is not None else MAG_MIN
-        out_prefix     = args.out_prefix or "seismic_kg_etas"
+    df = C.load_catalogue(path, mag_min, args.max_events)
+    df["t_days"] = (df["datetime"] - df["datetime"].min()).dt.total_seconds() / 86_400.0
+    x, y = C.project_km(df["latitude"].values, df["longitude"].values)
+    area = C.domain_area_km2(x, y)
 
-    out_graphml    = f"{out_prefix}_kg_etas.graphml"
-    out_edge_csv   = f"{out_prefix}_kg_etas_edges.csv"
-    out_node_csv   = f"{out_prefix}_kg_etas_nodes.csv"
-    out_params_csv = f"{out_prefix}_kg_etas_params.csv"
+    t0 = time.time()
+    etas = ETAS(df["t_days"].values, x, y, df["mag"].values, mc=mag_min, background=bg, bg_rate=rate, area=area,
+                max_iter=args.etas_max_iter, tol=args.tol, optimizer_maxiter=args.optimizer_maxiter).fit()
+    fit_seconds = time.time() - t0
 
-    # 1. Load
-    df = load_catalogue(catalogue_path, mag_min=mag_min, max_events=args.max_events)
+    ver = etas.verify()
+    log.info("Probability checks: %s", ver)
+    if not ver["all_passed"]:
+        log.warning("SOME PROBABILITY CHECKS FAILED - do not use these results; see the run JSON.")
 
-    t0 = df["datetime"].min()
-    df["t_days"] = (df["datetime"] - t0).dt.total_seconds() / 86_400.0
+    N = etas.N
+    out_strength = etas.W.sum(axis=1)                     # all children, original probabilities
+    best = etas.W.argmax(axis=0).astype(np.int64)
+    best_w = etas.W.max(axis=0)
+    best[best_w <= 0] = -1
+    ei, ej, ew = etas.pair_arrays(C.W_THRESHOLD)
+    G = C.build_knowledge_graph(df, etas.w_bg, out_strength, best, best_w, ei, ej, ew)
+    C.export_graph(G, df, out("kg_etas.graphml"), out("kg_etas_edges.csv"), out("kg_etas_nodes.csv"))
+    pi_, pj_, pw_ = etas.pair_arrays(C.PAIR_EXPORT_CUTOFF)
+    C.export_pairs(out("kg_etas_pairs.npz"), N, pi_, pj_, pw_, etas.w_bg)
 
-    # 2. Fit ETAS
-    etas = ETAS(
-        times = df["t_days"].values,
-        lats  = df["latitude"].values,
-        lons  = df["longitude"].values,
-        mags  = df["mag"].values,
-        mc    = mag_min,
-        max_iter = args.etas_max_iter,
-        optimizer_maxiter = args.optimizer_maxiter,
-    ).fit()
+    tr = pd.DataFrame(etas.trace)
+    tr.to_csv(out("kg_etas_trace.csv"), index=False)
+    final = dict(etas.params, mc=mag_min, n_events=N, background=bg, bg_rate=rate, area_km2=area,
+                 final_loglik=float(tr.loglik.iloc[-1]), n_em_iterations=len(tr), converged=etas.converged,
+                 bg_mass=float(etas.w_bg.sum()), roots_p_gt_0_5=int((etas.w_bg > 0.5).sum()))
+    pd.DataFrame([final]).to_csv(out("kg_etas_params.csv"), index=False)
+    C.visualise_subgraph(G, df, "ETAS", out("etas_subgraph.png"))
+    plot_trace(etas, out("etas_convergence.png"))
+    C.write_run_json(out("kg_etas_run.json"), dict(
+        model="ETAS v2", args=vars(args), resolved=dict(catalogue=path, mag_min=mag_min, background=bg, bg_rate=rate,
+                                                       area_km2=area, n_events=N),
+        final_params=etas.params, converged=etas.converged, n_em_iterations=len(tr),
+        fit_seconds=round(fit_seconds, 1), verification=ver, edge_threshold=C.W_THRESHOLD))
 
-    # 3. Build KG
-    G = build_knowledge_graph(df, etas, threshold=W_THRESHOLD)
-
-    # 4. Export
-    export_graph(G, df, etas, out_graphml, out_edge_csv, out_node_csv, out_params_csv)
-
-    # 5. Visualise
-    visualise_subgraph(G, df, seed_idx=VIZ_SEED_NODE, out_prefix=out_prefix)
-    plot_convergence(etas, out_prefix=out_prefix)
-
-    # 6. Print graph + parameter statistics
-    print("\n" + "="*60)
-    print("ETAS FITTED PARAMETERS")
-    print("="*60)
-    for k, v in etas.params.items():
-        print(f"  {k:<8} = {v:.5f}")
-    print(f"  mc       = {etas.mc}")
-    print(f"  mean background fraction = {etas.w_bg.mean():.3f}")
-
-    print("\n" + "="*60)
-    print("KNOWLEDGE GRAPH STATISTICS")
-    print("="*60)
-    print(f"Nodes              : {G.number_of_nodes():,}")
-    print(f"Edges              : {G.number_of_edges():,}")
-    print(f"Direct edges       : {sum(1 for _,_,d in G.edges(data=True) if d['edge_type']=='direct'):,}")
-    print(f"Indirect edges     : {sum(1 for _,_,d in G.edges(data=True) if d['edge_type']=='indirect'):,}")
-
-    out_deg = sorted(G.out_degree(), key=lambda x: x[1], reverse=True)[:10]
-    print("\nTop 10 most influential events (by out-degree):")
-    print(f"  {'Idx':>5}  {'Mag':>5}  {'Date':^22}  {'Out-deg':>7}  {'Lat':>7}  {'Lon':>8}")
-    for idx, deg in out_deg:
-        row = df.loc[idx]
-        print(f"  {idx:>5}  {row['mag']:>5.1f}  {str(row['datetime'])[:19]:^22}  "
-              f"{deg:>7}  {row['latitude']:>7.3f}  {row['longitude']:>8.3f}")
-    print("="*60)
+    print("\n" + "=" * 64)
+    print("ETAS v2 — SUMMARY")
+    print("=" * 64)
+    print(f"Events             : {N:,}      background: {bg}" + (f" @ {rate:.3e} /day/km^2" if bg == "fixed" else ""))
+    print(f"EM iterations      : {len(tr)}  (converged: {etas.converged})   fit time {fit_seconds / 60:.1f} min")
+    for k in PARAM_NAMES:
+        print(f"  {k:<6} = {etas.params[k]:.5g}")
+    print(f"Expected background events (sum P(bg)) : {etas.w_bg.sum():.1f}   roots (P>0.5): {(etas.w_bg > 0.5).sum()}")
+    print(f"Probability checks : {'ALL PASSED' if ver['all_passed'] else 'FAILED'}  {ver}")
+    print(f"Graph              : {G.number_of_nodes():,} nodes / {G.number_of_edges():,} edges (P >= {C.W_THRESHOLD})")
+    C.print_top_events(df, out_strength, etas.w_bg)
+    print("=" * 64)

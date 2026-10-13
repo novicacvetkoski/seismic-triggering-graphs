@@ -11,7 +11,7 @@ Usage
 -----
   python parse_jma.py                              # reads ./jma_data/*.txt -> ./jma_earthquakes_enriched.csv
   python parse_jma.py --input-dir /path/to/folder
-  python parse_jma.py --input-dir data --output combined.csv --pattern "*.txt"
+  python parse_jma.py --input-dir data --output jma_earthquakes_enriched.csv --pattern "*.txt"
 
 Just dump every JMA .txt file you have into one folder (any filenames,
 any number of files, any months/years) and point --input-dir at it. Every
