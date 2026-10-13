@@ -1,0 +1,56 @@
+{
+  "model": "MISD v2.1",
+  "args": {
+    "preset": "tohoku",
+    "catalogue": null,
+    "mag_min": null,
+    "max_events": 8000,
+    "out_prefix": "tohoku_full",
+    "out_dir": "results",
+    "kernel": "full",
+    "productivity": "loglinear",
+    "background": null,
+    "bg_rate": 1.2364e-06,
+    "max_iter": 300,
+    "t_bins_per_decade": 4,
+    "r_bins_per_decade": 4,
+    "mag_bin_width": 1.0,
+    "min_parents": 10
+  },
+  "resolved": {
+    "catalogue": "../Earthquake-series/jma_tohoku.csv",
+    "mag_min": 4.0,
+    "background": "fixed",
+    "bg_rate": 1.2364e-06,
+    "n_events": 5307,
+    "kernel": "full",
+    "productivity": "loglinear",
+    "area_km2": 287383.60209547984
+  },
+  "kernel_readout": {
+    "alpha_log10": 0.4728160838768574,
+    "alpha_log10_binned_check": 0.4728160838768574,
+    "p": 1.0118665350514011,
+    "s": 2.076001150689998,
+    "triggered_fraction": 0.9858784196710968
+  },
+  "converged": true,
+  "n_em_iterations": 126,
+  "fit_seconds": 38.6,
+  "verification": {
+    "all_finite": true,
+    "non_negative": true,
+    "max_abs_sum_minus_1": 6.128431095930864e-14,
+    "acausal_pairs": 0,
+    "sum_to_one": true,
+    "all_passed": true
+  },
+  "edge_threshold": 0.05,
+  "roots_p_gt_0_5": 28,
+  "environment": {
+    "python": "3.14.0",
+    "numpy": "2.3.5",
+    "pandas": "2.3.3",
+    "networkx": "3.6.1"
+  }
+}

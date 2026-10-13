@@ -1,0 +1,53 @@
+{
+  "model": "ETAS v2",
+  "args": {
+    "preset": "noto",
+    "catalogue": null,
+    "mag_min": null,
+    "max_events": 8000,
+    "out_prefix": "noto_bg_x0.5",
+    "out_dir": "results",
+    "background": null,
+    "bg_rate": 4.1838e-06,
+    "etas_max_iter": 30,
+    "optimizer_maxiter": 50,
+    "tol": 1e-05
+  },
+  "resolved": {
+    "catalogue": "../Earthquake-series/jma_noto.csv",
+    "mag_min": 2.0,
+    "background": "fixed",
+    "bg_rate": 4.1838e-06,
+    "area_km2": 3362.0624408074063,
+    "n_events": 1932
+  },
+  "final_params": {
+    "K": 0.03317623735603393,
+    "c": 0.0009138578894031968,
+    "p": 0.9387230195482592,
+    "alpha": 0.4919302603330063,
+    "d": 0.12449437104557652,
+    "gamma": 0.39500956724400316,
+    "q": 2.0187742457960263
+  },
+  "converged": true,
+  "n_em_iterations": 20,
+  "fit_seconds": 50.9,
+  "verification": {
+    "all_finite": true,
+    "non_negative": true,
+    "max_abs_sum_minus_1": 3.1086244689504383e-15,
+    "acausal_pairs": 0,
+    "sum_to_one": true,
+    "all_passed": true,
+    "max_abs_diff_vs_final_params": 0.0,
+    "consistent_with_final_params": true
+  },
+  "edge_threshold": 0.05,
+  "environment": {
+    "python": "3.14.0",
+    "numpy": "2.3.5",
+    "pandas": "2.3.3",
+    "networkx": "3.6.1"
+  }
+}

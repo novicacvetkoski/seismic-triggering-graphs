@@ -1,0 +1,56 @@
+{
+  "model": "MISD v2.1",
+  "args": {
+    "preset": "noto",
+    "catalogue": null,
+    "mag_min": null,
+    "max_events": 8000,
+    "out_prefix": "noto_full",
+    "out_dir": "results",
+    "kernel": "full",
+    "productivity": "loglinear",
+    "background": null,
+    "bg_rate": 8.3677e-06,
+    "max_iter": 300,
+    "t_bins_per_decade": 4,
+    "r_bins_per_decade": 4,
+    "mag_bin_width": 1.0,
+    "min_parents": 10
+  },
+  "resolved": {
+    "catalogue": "../Earthquake-series/jma_noto.csv",
+    "mag_min": 2.0,
+    "background": "fixed",
+    "bg_rate": 8.3677e-06,
+    "n_events": 1932,
+    "kernel": "full",
+    "productivity": "loglinear",
+    "area_km2": 3362.0624408074063
+  },
+  "kernel_readout": {
+    "alpha_log10": 0.6512179578528606,
+    "alpha_log10_binned_check": 0.6512179578528606,
+    "p": 0.8887035844946394,
+    "s": 2.9468200431539655,
+    "triggered_fraction": 0.9893817896518848
+  },
+  "converged": true,
+  "n_em_iterations": 151,
+  "fit_seconds": 5.2,
+  "verification": {
+    "all_finite": true,
+    "non_negative": true,
+    "max_abs_sum_minus_1": 2.708944180085382e-14,
+    "acausal_pairs": 0,
+    "sum_to_one": true,
+    "all_passed": true
+  },
+  "edge_threshold": 0.05,
+  "roots_p_gt_0_5": 15,
+  "environment": {
+    "python": "3.14.0",
+    "numpy": "2.3.5",
+    "pandas": "2.3.3",
+    "networkx": "3.6.1"
+  }
+}

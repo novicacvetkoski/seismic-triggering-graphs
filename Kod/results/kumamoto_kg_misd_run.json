@@ -1,0 +1,56 @@
+{
+  "model": "MISD v2.1",
+  "args": {
+    "preset": "kumamoto",
+    "catalogue": null,
+    "mag_min": null,
+    "max_events": 8000,
+    "out_prefix": "kumamoto",
+    "out_dir": "results",
+    "kernel": "separable",
+    "productivity": "loglinear",
+    "background": null,
+    "bg_rate": 3.9515e-05,
+    "max_iter": 300,
+    "t_bins_per_decade": 4,
+    "r_bins_per_decade": 4,
+    "mag_bin_width": 1.0,
+    "min_parents": 10
+  },
+  "resolved": {
+    "catalogue": "../Earthquake-series/jma_kumamoto.csv",
+    "mag_min": 2.0,
+    "background": "fixed",
+    "bg_rate": 3.9515e-05,
+    "n_events": 3523,
+    "kernel": "separable",
+    "productivity": "loglinear",
+    "area_km2": 1595.567877195111
+  },
+  "kernel_readout": {
+    "alpha_log10": 0.4000794679316026,
+    "alpha_log10_binned_check": 0.41859454897632536,
+    "p": 1.1745247377866521,
+    "s": 2.618064086825148,
+    "triggered_fraction": 0.9974787139583717
+  },
+  "converged": true,
+  "n_em_iterations": 31,
+  "fit_seconds": 7.9,
+  "verification": {
+    "all_finite": true,
+    "non_negative": true,
+    "max_abs_sum_minus_1": 5.5067062021407764e-14,
+    "acausal_pairs": 0,
+    "sum_to_one": true,
+    "all_passed": true
+  },
+  "edge_threshold": 0.05,
+  "roots_p_gt_0_5": 3,
+  "environment": {
+    "python": "3.14.0",
+    "numpy": "2.3.5",
+    "pandas": "2.3.3",
+    "networkx": "3.6.1"
+  }
+}

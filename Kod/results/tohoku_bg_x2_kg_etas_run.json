@@ -1,0 +1,53 @@
+{
+  "model": "ETAS v2",
+  "args": {
+    "preset": "tohoku",
+    "catalogue": null,
+    "mag_min": null,
+    "max_events": 8000,
+    "out_prefix": "tohoku_bg_x2",
+    "out_dir": "results",
+    "background": null,
+    "bg_rate": 2.4728e-06,
+    "etas_max_iter": 30,
+    "optimizer_maxiter": 50,
+    "tol": 1e-05
+  },
+  "resolved": {
+    "catalogue": "../Earthquake-series/jma_tohoku.csv",
+    "mag_min": 4.0,
+    "background": "fixed",
+    "bg_rate": 2.4728e-06,
+    "area_km2": 287383.60209547984,
+    "n_events": 5307
+  },
+  "final_params": {
+    "K": 0.05180283934719442,
+    "c": 0.02907379332317801,
+    "p": 1.0687797206028524,
+    "alpha": 0.49649301076365754,
+    "d": 14.80711554846818,
+    "gamma": 0.46919879811739046,
+    "q": 1.8586184902561962
+  },
+  "converged": true,
+  "n_em_iterations": 11,
+  "fit_seconds": 184.8,
+  "verification": {
+    "all_finite": true,
+    "non_negative": true,
+    "max_abs_sum_minus_1": 9.547918011776346e-15,
+    "acausal_pairs": 0,
+    "sum_to_one": true,
+    "all_passed": true,
+    "max_abs_diff_vs_final_params": 0.0,
+    "consistent_with_final_params": true
+  },
+  "edge_threshold": 0.05,
+  "environment": {
+    "python": "3.14.0",
+    "numpy": "2.3.5",
+    "pandas": "2.3.3",
+    "networkx": "3.6.1"
+  }
+}
