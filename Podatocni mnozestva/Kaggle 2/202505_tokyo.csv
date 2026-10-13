@@ -1,3 +1,0 @@
-time,latitude,longitude,depth,mag,magType,nst,gap,dmin,rms,net,id,updated,place,type,horizontalError,depthError,magError,magNst,status,locationSource,magSource
-2025-05-04T03:35:43.491Z,35.5952,139.7283,86.875,4.4,mb,42,91,1.557,0.52,us,us7000px0j,2025-05-06T07:14:45.878Z,"8 km N of Kawasaki, Japan",earthquake,7.15,7.222,0.082,43,reviewed,us,us
-2025-04-20T06:11:07.513Z,35.4329,140.038,85.576,4.5,mb,44,144,1.85,0.87,us,us6000q7ck,2025-05-08T11:27:19.657Z,"10 km SSW of Ichihara, Japan",earthquake,8.74,7.727,0.082,44,reviewed,us,us
