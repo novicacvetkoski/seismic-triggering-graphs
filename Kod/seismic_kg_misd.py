@@ -76,6 +76,7 @@ def parse_cli_args():
     p.add_argument("--r-bins-per-decade", type=int, default=R_BINS_PER_DECADE)
     p.add_argument("--mag-bin-width", type=float, default=MAG_BIN_WIDTH)
     p.add_argument("--min-parents", type=int, default=MIN_PARENTS_PER_BIN)
+    C.add_w_mag_args(p)
     return p.parse_args()
 
 
@@ -523,7 +524,9 @@ if __name__ == "__main__":
     os.makedirs(args.out_dir, exist_ok=True)
     out = lambda name: os.path.join(args.out_dir, f"{prefix}_{name}")
 
-    df = C.load_catalogue(path, mag_min, args.max_events)
+    w_mag = C.resolve_w_mag(args)
+    C.apply_pair_cutoff(args)
+    df = C.load_catalogue(path, mag_min, args.max_events, w_mag_jma=w_mag)
     df["t_days"] = (df["datetime"] - df["datetime"].min()).dt.total_seconds() / 86_400.0
 
     t0 = time.time()
@@ -554,7 +557,7 @@ if __name__ == "__main__":
     plot_kernels(misd, out("misd_kernels.png"))
     C.write_run_json(out("kg_misd_run.json"), dict(
         model="MISD v2.1", args=vars(args),
-        resolved=dict(catalogue=path, mag_min=mag_min, background=bg, bg_rate=rate, n_events=N,
+        resolved=dict(catalogue=path, mag_min=mag_min, background=bg, bg_rate=rate, n_events=N, w_mag_jma=w_mag,
                       kernel=misd.kernel_mode, productivity=misd.productivity, area_km2=misd.area),
         kernel_readout=dict(alpha_log10=misd.alpha_hat, alpha_log10_binned_check=misd.alpha_bins, p=misd.p_hat,
                             s=misd.s_hat, triggered_fraction=misd.triggered_fraction),

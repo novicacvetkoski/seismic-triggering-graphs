@@ -34,7 +34,10 @@ DATA_DIR = "../Earthquake-series"
 # sequence (estimate_background_rate.py, 'robust' = median monthly count). Used by default
 # for both models so that they share exactly the same background.
 SEQUENCE_PRESETS = {
-    "tohoku":   dict(catalogue=f"{DATA_DIR}/jma_tohoku.csv",   mag_min=4.0, out_prefix="tohoku",   bg_rate=1.2364e-06),
+    # w_mag_jma: the JMA catalogue lists the 2011 mainshock with its moment magnitude (magType W, Mw 9.0); its JMA-scale
+    # magnitude (displacement type, saturated) is Mj 8.4. Events of type W are set to this value so that all magnitudes
+    # in the productivity term are on the M_JMA scale (Hirose et al. 2011, Earth Planets Space 63:513).
+    "tohoku":   dict(catalogue=f"{DATA_DIR}/jma_tohoku.csv",   mag_min=4.0, out_prefix="tohoku",   bg_rate=1.2364e-06, w_mag_jma=8.4),
     "kumamoto": dict(catalogue=f"{DATA_DIR}/jma_kumamoto.csv", mag_min=2.0, out_prefix="kumamoto", bg_rate=3.9515e-05),
     "noto":     dict(catalogue=f"{DATA_DIR}/jma_noto.csv",     mag_min=2.0, out_prefix="noto",     bg_rate=8.3677e-06),
 }
@@ -54,7 +57,7 @@ VIZ_MAX_NODES = 150
 # data
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_catalogue(path, mag_min, max_events=MAX_EVENTS):
+def load_catalogue(path, mag_min, max_events=MAX_EVENTS, w_mag_jma=None):
     df = pd.read_csv(path, low_memory=False)
     df["datetime"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
     df = df.dropna(subset=["datetime", "latitude", "longitude", "depth", "mag"])
@@ -67,6 +70,13 @@ def load_catalogue(path, mag_min, max_events=MAX_EVENTS):
         if n0 - len(df):
             log.info("Dropped %d events with missing magType.", n0 - len(df))
 
+    # moment-magnitude entries (magType W) are not on the M_JMA scale: replace them by the JMA-scale value
+    if w_mag_jma is not None and "magType" in df.columns:
+        isw = df["magType"].astype(str).str.upper() == "W"
+        if isw.any():
+            log.info("Setting %d magType-W event(s) to M_JMA = %.1f (was %s).", int(isw.sum()), w_mag_jma,
+                     df.loc[isw, "mag"].round(1).tolist())
+            df.loc[isw, "mag"] = w_mag_jma
     df = df[df["mag"] >= mag_min]
     df = df[(df["datetime"] >= pd.Timestamp(DATE_START, tz="UTC")) &
             (df["datetime"] <= pd.Timestamp(DATE_END, tz="UTC"))]
@@ -87,6 +97,29 @@ def project_km(lats, lons):
 
 def domain_area_km2(x, y):
     return max((x.max() - x.min()) * (y.max() - y.min()), 1.0)
+
+
+def resolve_w_mag(args):
+    """M_JMA value that replaces magType-W (moment-magnitude) entries; None = keep them as they are."""
+    if getattr(args, "keep_w", False):
+        return None
+    if getattr(args, "w_mag_jma", None) is not None:
+        return args.w_mag_jma
+    pr = SEQUENCE_PRESETS.get(args.preset) if args.preset else None
+    return pr.get("w_mag_jma") if pr else None
+
+
+def apply_pair_cutoff(args):
+    """--pair-cutoff lowers the probability below which pairs are not written to the pairs file (default 1e-4)."""
+    global PAIR_EXPORT_CUTOFF
+    if getattr(args, "pair_cutoff", None) is not None:
+        PAIR_EXPORT_CUTOFF = float(args.pair_cutoff)
+
+
+def add_w_mag_args(p):
+    p.add_argument("--pair-cutoff", type=float, help="write all pairs with probability >= this value to the pairs file (default 1e-4)")
+    p.add_argument("--w-mag-jma", type=float, help="M_JMA assigned to magType-W events (default: the preset's value, 8.4 for Tohoku)")
+    p.add_argument("--keep-w", action="store_true", help="keep magType-W magnitudes (Mw) unchanged (sensitivity check)")
 
 
 def resolve_config(args, default_model_bg):
@@ -165,8 +198,9 @@ def export_graph(G, df, out_graphml, out_edge_csv, out_node_csv):
     log.info("Saved %s, %s, %s", out_graphml, out_edge_csv, out_node_csv)
 
 
-def export_pairs(path, N, parent, child, w, w_bg, cutoff=PAIR_EXPORT_CUTOFF):
+def export_pairs(path, N, parent, child, w, w_bg, cutoff=None):
     """Estimated probabilities for later analysis (forest realisations, sensitivity)."""
+    cutoff = PAIR_EXPORT_CUTOFF if cutoff is None else cutoff
     m = w >= cutoff
     np.savez_compressed(path, N=N, cutoff=cutoff, parent=parent[m].astype(np.int32),
                         child=child[m].astype(np.int32), w=w[m].astype(np.float32),

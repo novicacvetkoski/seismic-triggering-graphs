@@ -37,7 +37,7 @@ SEQ = {   # name -> (file, Mc used in the pipeline, label)
 DM = 0.1          # JMA magnitudes are reported to 0.1
 
 
-def load(path):
+def load(path, w_mag_jma=None):
     df = pd.read_csv(path, low_memory=False)
     n_raw = len(df)
     df["datetime"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
@@ -46,9 +46,12 @@ def load(path):
     n_nomt = int(df["magType"].isna().sum()) if "magType" in df.columns else 0
     if "magType" in df.columns:
         df = df.dropna(subset=["magType"])
+    n_w = int((df["magType"].astype(str).str.upper() == "W").sum()) if "magType" in df.columns else 0
+    if n_w and w_mag_jma is not None:     # moment-magnitude entry: use the JMA-scale value (see kg_common.py)
+        df.loc[df["magType"].astype(str).str.upper() == "W", "mag"] = w_mag_jma
     df = df.sort_values("datetime").reset_index(drop=True)
     dup = int(df.duplicated(subset=["time", "latitude", "longitude", "mag"]).sum())
-    return df, dict(n_raw=n_raw, n_dropped_core=n_raw - n_core, n_dropped_magtype=n_nomt, n_dup=dup)
+    return df, dict(n_w=n_w, n_raw=n_raw, n_dropped_core=n_raw - n_core, n_dropped_magtype=n_nomt, n_dup=dup)
 
 
 def fmd(mags, mmin=None):
@@ -68,6 +71,16 @@ def b_value(mags, mc):
         return np.nan, np.nan, n
     b = np.log10(np.e) / (x.mean() - (mc - DM / 2))
     return b, b / np.sqrt(n), n
+
+
+def b_scan(mags, mc_used, lo=-1.0, hi=1.5):
+    """b-value (Aki-Utsu / Bender) as a function of the threshold: stability, not closeness to 1, indicates completeness."""
+    out = []
+    for mc in np.round(np.arange(mc_used + lo, mc_used + hi + 1e-9, DM), 2):
+        b, se, n = b_value(mags, mc)
+        if n >= 50:
+            out.append((mc, b, se, n))
+    return out
 
 
 def maxc(mags):
@@ -112,12 +125,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", default=".")
     ap.add_argument("--out-dir", default=".")
+    ap.add_argument("--w-mag-jma", type=float, default=8.4,
+                    help="M_JMA assigned to the magType-W (moment magnitude) entry of the Tohoku mainshock")
     a = ap.parse_args()
     os.makedirs(os.path.join(a.out_dir, "figures"), exist_ok=True)
 
     D, M, rows = {}, {}, []
     for k, (f, mc_used, lab) in SEQ.items():
-        df, info = load(os.path.join(a.data_dir, f))
+        df, info = load(os.path.join(a.data_dir, f), w_mag_jma=a.w_mag_jma if k == "tohoku" else None)
         D[k] = df
         sub = df[df["mag"] >= mc_used]
         mx = maxc(df["mag"].values)
@@ -125,6 +140,8 @@ def main():
         b, bse, nb = b_value(df["mag"].values, mc_used)
         mtc = df["magType"].astype(str).str.upper().value_counts()
         M[k] = dict(mx=mx, g=g, b=b, bse=bse, mcused=mc_used)
+        sc = [x for x in b_scan(df['mag'].values, mc_used) if mc_used - 1e-9 <= x[0] <= mc_used + 1.0 + 1e-9]
+        M[k]['bmin'], M[k]['bmax'] = (min(x[1] for x in sc), max(x[1] for x in sc)) if sc else (np.nan, np.nan)
         rows.append(dict(
             sequence=k, label=lab,
             t_start=str(df["datetime"].min())[:10], t_end=str(df["datetime"].max())[:10],
@@ -135,7 +152,8 @@ def main():
             mc_maxc=mx, mc_maxc_plus=mx + 0.2, mc_gft90=g[0.90], mc_gft95=g[0.95],
             b=b, b_se=bse, depth_median=df.depth.median(), depth_p95=df.depth.quantile(.95),
             magtype_V=int(mtc.get("V", 0)), magtype_D=int(mtc.get("D", 0)),
-            magtype_other=int(len(df) - mtc.get("V", 0) - mtc.get("D", 0))))
+            magtype_other=int(len(df) - mtc.get("V", 0) - mtc.get("D", 0)), n_mag_W=info["n_w"],
+            b_min_scan=M[k]['bmin'], b_max_scan=M[k]['bmax']))
     S = pd.DataFrame(rows)
     S.to_csv(os.path.join(a.out_dir, "podatoci_sumarno.csv"), index=False)
 
@@ -183,6 +201,14 @@ def main():
         ax[i].set(title=SEQ[k][2], xlabel="days since first event (window centre)", ylabel="Mc (MAXC + 0.2)")
     plt.tight_layout(); plt.savefig(os.path.join(a.out_dir, "figures", "fig_mc_vreme.pdf")); plt.close()
 
+    fig, ax = plt.subplots(1, 3, figsize=(15, 3.9))
+    for i, (k, df) in enumerate(D.items()):
+        sc = b_scan(df["mag"].values, SEQ[k][1])
+        ax[i].errorbar([x[0] for x in sc], [x[1] for x in sc], yerr=[x[2] for x in sc], fmt="o-", ms=3, color=cols[k], capsize=2)
+        ax[i].axvline(SEQ[k][1], color="k", ls="--"); ax[i].axhline(1.0, color="gray", lw=.6)
+        ax[i].set(title=SEQ[k][2], xlabel="threshold $M_c$", ylabel="b-value")
+    plt.tight_layout(); plt.savefig(os.path.join(a.out_dir, "figures", "fig_b_mc.pdf")); plt.close()
+
     # ---- LaTeX macros -----------------------------------------------------------------------
     def f(v, d=1):
         return "n/a" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:.{d}f}".replace(".", "{,}")
@@ -198,7 +224,8 @@ def main():
                          ("NDup", str(r.n_duplicates)), ("NDropMagType", str(r.n_dropped_magtype)),
                          ("NDropCore", str(r.n_dropped_core)), ("DepthMed", f(r.depth_median, 0)),
                          ("DepthPNinetyFive", f(r.depth_p95, 0)), ("NMagV", str(r.magtype_V)), ("NMagD", str(r.magtype_D)),
-                         ("NMagOther", str(r.magtype_other))]:
+                         ("NMagOther", str(r.magtype_other)), ("NMagW", str(r.n_mag_W)),
+                         ("BvalScanMin", f(r.b_min_scan, 2)), ("BvalScanMax", f(r.b_max_scan, 2))]:
             L.append(f"\\newcommand{{\\{key}{n}}}{{{val}}}")
     rowsT = []
     for _, r in S.iterrows():

@@ -36,6 +36,12 @@ for model in a.models.split(","):
         for suffix, rate in variants:
             jobs.append([sys.executable, f"seismic_kg_{model}.py", "--preset", seq, "--out-dir", a.out_dir,
                          "--out-prefix", seq + suffix, "--bg-rate", f"{rate:.4e}"])
+        if seq == "tohoku" and not a.only_primary:       # keep the Mw 9.0 magType-W entry instead of M_JMA 8.4
+            jobs.append([sys.executable, f"seismic_kg_{model}.py", "--preset", seq, "--out-dir", a.out_dir,
+                         "--out-prefix", seq + "_keepW", "--bg-rate", f"{robust:.4e}", "--keep-w"])
+        if model == "etas" and not a.only_primary:      # old v2 behaviour: spatial kernel integrated over the whole plane
+            jobs.append([sys.executable, "seismic_kg_etas.py", "--preset", seq, "--out-dir", a.out_dir,
+                         "--out-prefix", seq + "_noedge", "--bg-rate", f"{robust:.4e}", "--no-edge-correction"])
         if model == "misd" and not a.only_primary:
             jobs.append([sys.executable, "seismic_kg_misd.py", "--preset", seq, "--out-dir", a.out_dir,
                          "--out-prefix", seq + "_full", "--bg-rate", f"{robust:.4e}", "--kernel", "full"])
